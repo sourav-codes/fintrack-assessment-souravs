@@ -1,4 +1,4 @@
-import { eq, between } from 'drizzle-orm'
+import { eq, between, and, inArray } from 'drizzle-orm'
 import { db } from '@/lib/db'
 import { payments, reconciliations } from '@/lib/db/schema'
 
@@ -49,7 +49,13 @@ export interface Discrepancy {
 
 /**
  * Finds the best matching internal payment for a given bank record.
- * Matching strategy: find by amount.
+ *
+ * BUG #5:
+ * Issue: Matching only by amount will produce false positives. Multiple payments
+ *        often share the same amount (e.g., subscription fees).
+ * Severity: HIGH (Logic)
+ * Suggested Solution: Match by `reference` === `externalRef` as primary key,
+ *                     with amount as validation for discrepancy detection.
  */
 function findMatch(bankRecord: BankRecord, candidates: Payment[]): Payment | undefined {
   return candidates.find(p => p.amount === bankRecord.amount)
@@ -64,6 +70,13 @@ function isInPeriod(date: Date, periodStart: Date, periodEnd: Date): boolean {
 
 /**
  * Parses a bank-supplied date string into a Date object.
+ *
+ * BUG #9:
+ * Issue: `new Date(isoString)` parses in local timezone if string lacks offset.
+ *        Bank dates might be in different timezone than server.
+ * Severity: MEDIUM (Logic)
+ * Suggested Solution: Validate input format includes timezone, or explicitly
+ *                     handle timezone conversion. ISO 8601 with offset is safe.
  */
 function parseBankDate(isoString: string): Date {
   return new Date(isoString)
@@ -71,6 +84,11 @@ function parseBankDate(isoString: string): Date {
 
 /**
  * Calculates the monetary discrepancy between a bank record and a payment.
+ *
+ * BUG #6 (related):
+ * Issue: Floating-point arithmetic can accumulate errors.
+ * Severity: HIGH (Logic)
+ * Suggested Solution: Use integer cents for calculations.
  */
 function calculateDelta(bankAmount: number, systemAmount: number): number {
   return bankAmount - systemAmount
@@ -78,6 +96,19 @@ function calculateDelta(bankAmount: number, systemAmount: number): number {
 
 /**
  * Marks a payment as reconciled.
+ *
+ * BUG #8:
+ * Issue: Race condition - Two concurrent requests could both read `status === 'pending'`,
+ *        then both update. No transaction or optimistic locking.
+ * Severity: HIGH (Logic)
+ * Suggested Solution: Use atomic update: `UPDATE ... WHERE id = ? AND status IN ('pending', 'cleared')`
+ *                     to ensure only one request can successfully update.
+ *
+ * BUG #14:
+ * Issue: Status check too restrictive - only updates if `status === 'pending'`,
+ *        but `cleared` payments should also be reconcilable.
+ * Severity: MEDIUM (Logic)
+ * Suggested Solution: Allow status in ['pending', 'cleared'] to be marked as reconciled.
  */
 async function markReconciled(paymentId: string): Promise<void> {
   const [payment] = await db
@@ -95,6 +126,29 @@ async function markReconciled(paymentId: string): Promise<void> {
 
 // ─── Main export ─────────────────────────────────────────────────────────────
 
+/**
+ * BUG #7:
+ * Issue: The `discrepancies` array is declared but never populated. Records that
+ *        match by reference but differ in amount should be flagged as discrepancies.
+ * Severity: HIGH (Logic)
+ * Suggested Solution: Add logic - if reference matches but amount differs,
+ *                     push to `discrepancies` instead of `matched`.
+ *
+ * BUG #6:
+ * Issue: Summing dollar amounts with `reduce()` accumulates floating-point errors
+ *        (e.g., 0.1 + 0.2 = 0.30000000000000004). In financial reconciliation,
+ *        this produces incorrect totals.
+ * Severity: HIGH (Logic)
+ * Suggested Solution: Convert to integer cents for arithmetic, or use a decimal library.
+ *                     At minimum: Math.round(sum * 100) / 100
+ *
+ * BUG #16:
+ * Issue: `bankOnly` includes records filtered out by `isInPeriod()`, which weren't
+ *        actually "unmatched" — they were excluded from consideration.
+ * Severity: LOW (Logic)
+ * Suggested Solution: Track excluded-by-period separately, or filter `bankOnly`
+ *                     to only include in-period records.
+ */
 export async function reconcilePayments(
   bankData: BankRecord[],
   periodStart: Date,
