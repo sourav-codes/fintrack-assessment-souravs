@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
-import { eq } from 'drizzle-orm'
+import { eq, desc } from 'drizzle-orm'
 import { db } from '@/lib/db'
 import { reconciliationRuns } from '@/lib/db/schema'
 import { getSession } from '@/lib/auth'
@@ -99,7 +99,8 @@ export async function POST(req: NextRequest) {
  *
  * FIX #4: Added authentication check
  * FIX #2: Removed SQL injection - using Drizzle ORM parameterized queries
- * FIX #11: Returns all runs when id is not provided (for dashboard)
+ * FIX #11: Returns recent runs when id is not provided (for dashboard)
+ *          Limited to 100 entries to prevent UI crashes with large datasets
  */
 export async function GET(req: NextRequest) {
   try {
@@ -134,11 +135,13 @@ export async function GET(req: NextRequest) {
 
       return NextResponse.json(run[0])
     } else {
-      // Return all runs for dashboard display
+      // Return recent runs for dashboard display
+      // Limited to 100 entries to prevent UI performance issues
       const runs = await db
         .select()
         .from(reconciliationRuns)
-        .orderBy(reconciliationRuns.createdAt)
+        .orderBy(desc(reconciliationRuns.createdAt))
+        .limit(100)
 
       return NextResponse.json({ runs })
     }

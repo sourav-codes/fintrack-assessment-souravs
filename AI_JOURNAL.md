@@ -11,6 +11,7 @@
 | 2 | Create all required files and update CLARIFICATIONS.md and AUDIT.md | 5 | Yes | Successfully created all files with comprehensive analysis |
 | 3 | Add inline comments documenting bugs with Issue/Severity/Suggested Solution pattern | 5 | Yes | Comments added to all three source files at the exact locations of each bug |
 | 4 | Implement all fixes for the documented bugs | 5 | Yes | All 16 bugs fixed plus Task 3c new feature implemented |
+| 5 | Fix #11 returning all entries without limit | 4 | Partial | Rejected unbounded query - added limit of 100 entries to prevent UI crashes |
 
 ## Progress Log
 
@@ -50,7 +51,7 @@ All bugs fixed and new feature implemented:
 | #3 | Returns generic error messages; logs full error via `logger.error()` server-side |
 | #4 | Added `getSession()` check at start of both POST and GET handlers |
 | #10 | Removed redundant insert; `reconcilePayments()` handles persistence |
-| #11 | GET now returns all runs when `id` is null, or specific run when `id` provided |
+| #11 | GET now returns recent runs (limit 100, descending by date) when `id` is null, or specific run when `id` provided |
 | #15 | Changed POST success response from `status: 200` to `status: 201` |
 
 #### ReconciliationDashboard.tsx Fixes:
@@ -82,6 +83,12 @@ All bugs fixed and new feature implemented:
   2. Simpler and more performant
   3. Industry standard for financial applications
   4. Assessment rules state "You may not use any external reconciliation library"
+
+- **Fix #11 - Unbounded query rejected**: AI's initial implementation returned ALL reconciliation runs without a limit. This was rejected because:
+  1. Could crash the UI with large datasets (thousands of runs)
+  2. Poor UX - users don't need to see all historical runs at once
+  3. Network/memory overhead on both server and client
+  4. **Modified to**: Limit 100 entries, ordered by most recent first (`desc(createdAt)`)
 
 **The moment you most doubted the AI output and how you verified it**:
 When implementing the atomic update for `markReconciled()`, I questioned whether the Drizzle ORM `.returning()` approach would correctly indicate if a row was updated. Verified by checking Drizzle ORM documentation - the returning clause returns an array of affected rows, so checking `result.length > 0` correctly determines if the update succeeded.
