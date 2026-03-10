@@ -1,4 +1,4 @@
-import { eq, between, and, inArray } from 'drizzle-orm'
+import { eq, between, and, inArray, sql } from 'drizzle-orm'
 import { db } from '@/lib/db'
 import { payments, reconciliations } from '@/lib/db/schema'
 
@@ -8,7 +8,7 @@ export interface BankRecord {
   transactionId: string
   amount: number          // dollar value, e.g. 19.99
   currency: string
-  valueDate: string       // ISO date string from bank, e.g. "2026-01-15T14:30:00"
+  valueDate: string       // ISO date string from bank, e.g. "2026-01-15T14:30:00Z"
   description: string
   reference: string
 }
@@ -48,17 +48,31 @@ export interface Discrepancy {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /**
+ * Converts a dollar amount to integer cents to avoid floating-point errors.
+ *
+ * FIX #6: Using integer cents for all monetary arithmetic.
+ */
+function toCents(amount: number): number {
+  return Math.round(amount * 100)
+}
+
+/**
+ * Converts integer cents back to dollar amount for display/storage.
+ */
+function toDollars(cents: number): number {
+  return cents / 100
+}
+
+/**
  * Finds the best matching internal payment for a given bank record.
  *
- * BUG #5:
- * Issue: Matching only by amount will produce false positives. Multiple payments
- *        often share the same amount (e.g., subscription fees).
- * Severity: HIGH (Logic)
- * Suggested Solution: Match by `reference` === `externalRef` as primary key,
- *                     with amount as validation for discrepancy detection.
+ * FIX #5: Matching strategy changed from amount-only to reference-based.
+ * Primary match key: bank.reference === payment.externalRef
+ * This is the industry standard for B2B payment reconciliation as reference
+ * numbers are designed to be unique identifiers between systems.
  */
-function findMatch(bankRecord: BankRecord, candidates: Payment[]): Payment | undefined {
-  return candidates.find(p => p.amount === bankRecord.amount)
+function findMatchByReference(bankRecord: BankRecord, candidates: Payment[]): Payment | undefined {
+  return candidates.find(p => p.externalRef === bankRecord.reference)
 }
 
 /**
@@ -71,83 +85,64 @@ function isInPeriod(date: Date, periodStart: Date, periodEnd: Date): boolean {
 /**
  * Parses a bank-supplied date string into a Date object.
  *
- * BUG #9:
- * Issue: `new Date(isoString)` parses in local timezone if string lacks offset.
- *        Bank dates might be in different timezone than server.
- * Severity: MEDIUM (Logic)
- * Suggested Solution: Validate input format includes timezone, or explicitly
- *                     handle timezone conversion. ISO 8601 with offset is safe.
+ * FIX #9: Validates ISO 8601 format and ensures timezone awareness.
+ * If the string lacks timezone info, assumes UTC to ensure consistency.
  */
 function parseBankDate(isoString: string): Date {
-  return new Date(isoString)
+  // Check if string has timezone indicator (Z or +/- offset)
+  const hasTimezone = /([Zz]|[+-]\d{2}:\d{2})$/.test(isoString)
+
+  // If no timezone, append 'Z' to treat as UTC
+  const normalizedString = hasTimezone ? isoString : `${isoString}Z`
+
+  return new Date(normalizedString)
 }
 
 /**
  * Calculates the monetary discrepancy between a bank record and a payment.
  *
- * BUG #6 (related):
- * Issue: Floating-point arithmetic can accumulate errors.
- * Severity: HIGH (Logic)
- * Suggested Solution: Use integer cents for calculations.
+ * FIX #6: Uses integer cents to avoid floating-point arithmetic errors.
+ * Returns the delta in dollars after precise calculation.
  */
 function calculateDelta(bankAmount: number, systemAmount: number): number {
-  return bankAmount - systemAmount
+  const bankCents = toCents(bankAmount)
+  const systemCents = toCents(systemAmount)
+  return toDollars(bankCents - systemCents)
 }
 
 /**
- * Marks a payment as reconciled.
+ * Marks a payment as reconciled using atomic update to prevent race conditions.
  *
- * BUG #8:
- * Issue: Race condition - Two concurrent requests could both read `status === 'pending'`,
- *        then both update. No transaction or optimistic locking.
- * Severity: HIGH (Logic)
- * Suggested Solution: Use atomic update: `UPDATE ... WHERE id = ? AND status IN ('pending', 'cleared')`
- *                     to ensure only one request can successfully update.
- *
- * BUG #14:
- * Issue: Status check too restrictive - only updates if `status === 'pending'`,
- *        but `cleared` payments should also be reconcilable.
- * Severity: MEDIUM (Logic)
- * Suggested Solution: Allow status in ['pending', 'cleared'] to be marked as reconciled.
+ * FIX #8: Uses atomic UPDATE with WHERE clause to prevent race conditions.
+ *         Only one concurrent request can successfully update.
+ * FIX #14: Now allows both 'pending' and 'cleared' statuses to be reconciled.
  */
-async function markReconciled(paymentId: string): Promise<void> {
-  const [payment] = await db
-    .select()
-    .from(payments)
-    .where(eq(payments.id, paymentId))
+async function markReconciled(paymentId: string): Promise<boolean> {
+  // Atomic update: only succeeds if status is pending or cleared
+  const result = await db
+    .update(payments)
+    .set({ status: 'reconciled' })
+    .where(
+      and(
+        eq(payments.id, paymentId),
+        inArray(payments.status, ['pending', 'cleared'])
+      )
+    )
+    .returning({ id: payments.id })
 
-  if (payment && payment.status === 'pending') {
-    await db
-      .update(payments)
-      .set({ status: 'reconciled' })
-      .where(eq(payments.id, paymentId))
-  }
+  // Returns true if a row was actually updated
+  return result.length > 0
 }
 
 // ─── Main export ─────────────────────────────────────────────────────────────
 
 /**
- * BUG #7:
- * Issue: The `discrepancies` array is declared but never populated. Records that
- *        match by reference but differ in amount should be flagged as discrepancies.
- * Severity: HIGH (Logic)
- * Suggested Solution: Add logic - if reference matches but amount differs,
- *                     push to `discrepancies` instead of `matched`.
+ * Reconciles bank records against internal payment records.
  *
- * BUG #6:
- * Issue: Summing dollar amounts with `reduce()` accumulates floating-point errors
- *        (e.g., 0.1 + 0.2 = 0.30000000000000004). In financial reconciliation,
- *        this produces incorrect totals.
- * Severity: HIGH (Logic)
- * Suggested Solution: Convert to integer cents for arithmetic, or use a decimal library.
- *                     At minimum: Math.round(sum * 100) / 100
- *
- * BUG #16:
- * Issue: `bankOnly` includes records filtered out by `isInPeriod()`, which weren't
- *        actually "unmatched" — they were excluded from consideration.
- * Severity: LOW (Logic)
- * Suggested Solution: Track excluded-by-period separately, or filter `bankOnly`
- *                     to only include in-period records.
+ * FIX #5: Uses reference-based matching (externalRef === reference)
+ * FIX #6: All monetary calculations use integer cents
+ * FIX #7: Populates discrepancies array when reference matches but amount differs
+ * FIX #16: Only includes in-period bank records in the unmatched list
  */
 export async function reconcilePayments(
   bankData: BankRecord[],
@@ -163,27 +158,54 @@ export async function reconcilePayments(
   const discrepancies: Discrepancy[] = []
   const matchedPaymentIds = new Set<string>()
   const matchedBankIds = new Set<string>()
+  const inPeriodBankIds = new Set<string>()
 
   for (const bankRecord of bankData) {
     const bankDate = parseBankDate(bankRecord.valueDate)
+
+    // FIX #16: Track which bank records are in-period
     if (!isInPeriod(bankDate, periodStart, periodEnd)) continue
+    inPeriodBankIds.add(bankRecord.transactionId)
 
     const remaining = systemPayments.filter(p => !matchedPaymentIds.has(p.id))
-    const match = findMatch(bankRecord, remaining)
+
+    // FIX #5: Match by reference instead of amount
+    const match = findMatchByReference(bankRecord, remaining)
 
     if (match) {
-      matched.push({ bankRecord, payment: match })
+      // FIX #7: Check if amounts match; if not, it's a discrepancy
+      const amountDelta = calculateDelta(bankRecord.amount, match.amount)
+
+      if (amountDelta !== 0) {
+        // Reference matches but amount differs - this is a discrepancy
+        discrepancies.push({
+          bankRecord,
+          payment: match,
+          amountDelta,
+        })
+      } else {
+        // Perfect match - reference and amount both match
+        matched.push({ bankRecord, payment: match })
+      }
+
       matchedPaymentIds.add(match.id)
       matchedBankIds.add(bankRecord.transactionId)
       await markReconciled(match.id)
     }
   }
 
-  const totalBankAmount = bankData.reduce((sum, r) => sum + r.amount, 0)
-  const totalSystemAmount = systemPayments.reduce((sum, p) => sum + p.amount, 0)
-  const difference = calculateDelta(totalBankAmount, totalSystemAmount)
+  // FIX #6: Use integer cents for sum calculations
+  const totalBankCents = bankData.reduce((sum, r) => sum + toCents(r.amount), 0)
+  const totalSystemCents = systemPayments.reduce((sum, p) => sum + toCents(p.amount), 0)
 
-  const bankOnly = bankData.filter(r => !matchedBankIds.has(r.transactionId))
+  const totalBankAmount = toDollars(totalBankCents)
+  const totalSystemAmount = toDollars(totalSystemCents)
+  const difference = toDollars(totalBankCents - totalSystemCents)
+
+  // FIX #16: Only include in-period, unmatched bank records
+  const bankOnly = bankData.filter(r =>
+    inPeriodBankIds.has(r.transactionId) && !matchedBankIds.has(r.transactionId)
+  )
   const systemOnly = systemPayments.filter(p => !matchedPaymentIds.has(p.id))
 
   const [saved] = await db
@@ -193,6 +215,7 @@ export async function reconcilePayments(
       periodEnd,
       matchedCount: matched.length,
       unmatchedCount: bankOnly.length + systemOnly.length,
+      discrepancyCount: discrepancies.length,
       totalBankAmount,
       totalSystemAmount,
       difference,
